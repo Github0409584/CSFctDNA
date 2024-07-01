@@ -1,0 +1,295 @@
+---
+title: "Prognostic model"
+author: "Yilong Wu"
+date: "2023-09-05"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: united
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+rm(list=ls())
+library(openxlsx)
+library(readxl)
+require(tidyverse)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(plyr)
+library(ComplexHeatmap)
+library(survival)
+library(table1)
+library(survminer)
+
+
+```
+
+
+
+```{r}
+###Combination clinical information and gene mutation
+Combine_climut<- function(clinic, mut, gene){
+  
+  for (i in gene){
+    
+    mutation<- mut %>%
+      filter(Gene ==i)
+    
+    clinic[,i] <- ifelse(clinic$CSF_RSID %in% mutation$RSID,"1","0")
+  }
+  return (clinic)  
+}
+
+###Comparison of baseline characteristics between groups
+
+pvalue <- function(x, ...) {
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  if (is.numeric(y)) {
+    p <- t.test(y ~ g)$p.value
+  } else {
+    p <- chisq.test(table(y, g))$p.value
+  }
+  c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+###Univariable cox regression
+Get_coxResult<- function(data,variable){
+  
+  cox.result <- data.frame()
+  for(i in variable){
+  my.surv = Surv(data$OS_month,data$OS_event)
+  cox.model <- summary(coxph(my.surv~data[,i],data = data))
+  p.cox <- cox.model$waldtest[3]
+  log.model <- survdiff(my.surv~data[,i],data = data)
+  p.logrank <- 1-pchisq(log.model$chisq,length(log.model$n)-1)
+  cox.result <- rbind(cox.result, data.frame(Variant = i,
+                                               HR=round(cox.model$conf.int[,1],2),
+                                               `lower 95%CI`=round(cox.model$conf.int[,3],2),
+                                               `upper 95%CI`=round(cox.model$conf.int[,4],2),
+                                               P.cox=round(cox.model$coefficients[,5],3),
+                                               P.logrank= round(p.logrank,3)))
+  }
+  cox.result$Hazard.ratio <- paste0(format(cox.result$HR,nsmall=2)," (",format(cox.result$lower.95.CI,nsamll = 2),",", format(cox.result$upper.95.CI,nsmall = 2),")")
+  cox.result <- cox.result[order(cox.result$HR,decreasing = T),]
+  return(cox.result)
+}
+
+
+###Forest plot for univariable cox regression
+plotutil_univariant_forestplot <- function(cox.result){
+  pic <- ggplot(cox.result,aes(x=HR,y=factor(Variant,levels = Variant))) +  
+            geom_point(size=3,colour="#1c61b6") +
+            geom_errorbarh(aes(xmin = lower.95.CI, xmax = upper.95.CI),colour="#1c61b6",height = 0.25)+
+            geom_vline(aes(xintercept=1),linetype="dashed")+
+            scale_x_log10(limits=c(0.01,10000), breaks=c(0.01,0.1,1,10,100), labels=c(0.01,0.1,1,10,100)) +
+            xlab('') +ylab("") +theme_bw() +
+            scale_y_discrete(expand = c(0.1,0)) +
+            theme(panel.grid.major = element_blank(), 
+                  panel.grid.minor = element_blank(),
+                  plot.background = element_rect(color ='black'),
+                  axis.text=element_text(size=10,face = "bold"),
+                  legend.text=element_text(size=11)) +
+            geom_text(aes(x=400, y= Variant, label=Hazard.ratio), size=3.5, data=cox.result) +
+            geom_text(aes(x=7000, y= Variant, label=P.logrank), size=3.5, data=cox.result) +
+            geom_text(aes(x=400, y= nrow(cox.result)+0.3*(nrow(cox.result)/5), label="HR(95%CI)"),size=3.5) + 
+            geom_text(aes(x=7000, y= nrow(cox.result)+0.3*(nrow(cox.result)/5), label="P-value"),size=3.5)
+  return(pic)
+}
+
+###KM curves
+print_km <- function(data, survival,event,group,ytitle,legend){
+
+  plot_data <- data %>%
+    dplyr::select(surv = survival,event = event,group = group)
+  plot_data <- plot_data[complete.cases(plot_data),]
+  cox<-coxph(Surv(surv, event) ~ group,data = plot_data)
+  p<-summary(cox)$coefficients[,'Pr(>|z|)']
+  HR<- round(summary(cox)$conf.int[,1],2)
+  HR.lower<- round(summary(cox)$conf.int[,3],2)
+  HR.upper<- round(summary(cox)$conf.int[,4],2)
+  
+  mysurvdiff <- survdiff(Surv(surv,event) ~ group,data = plot_data)
+  p.val <- 1 - pchisq(mysurvdiff$chisq, length(mysurvdiff$n) - 1)
+  
+  fit <- survfit(Surv(surv, event) ~ group,data = plot_data)
+  
+  ggsurvplot(fit,
+             data = plot_data,  
+             palette=c("blue","red"), 
+             conf.int = F, 
+             xlab = "months",
+             ylab = ytitle,
+             break.time.by = 4, 
+             risk.table.title="Number at risk",
+             risk.table=T, 
+             risk.table.height=.25,
+             pval = case_when(
+               p.val<0.001~paste("P<0.001 ","\nHR = ",HR," (",HR.lower,"-",HR.upper,")",sep = ""),
+               p.val>=0.001&p.val<0.01~paste("P = ",round(p.val,3),"\nHR = ",HR," (",HR.lower,"-",HR.upper,")",sep = ""),
+               p.val>=0.01~paste("P = ",round(p.val,2),"\nHR = ",HR," (",HR.lower,"-",HR.upper,")",sep = "")
+             ),
+             pval.size = 3.5,
+             legend.title = "",
+             legend.labs = legend,
+             surv.scale = "percent",
+             break.y.by = 0.2 
+  )
+}
+
+```
+## 1.Baseline characteristics
+```{r}
+clinic <- read.xlsx("./clean data/预后分型-2024-1-22.xlsx", sheet = "Sheet1") 
+CSF_mut <- read.xlsx("./clean data/匹配肿瘤和脑脊液.xlsx", sheet = "CSF-NGS") 
+
+gene<- c("EGFR","TP53","KRAS","RB1","CDKN2A","MYC","SMAD4","STK11","CDK6")
+cli_mut <- Combine_climut(clinic, CSF_mut,gene)
+
+clinic2 <- cli_mut %>%
+  mutate(Sex = factor(Sex, levels = c(0,1),labels = c("Male","Female"))) %>%
+  mutate(Pathology = factor(Pathology, levels = c(1,0),labels = c("Adenocarcinoma","Others"))) %>%
+  mutate(Smoking = factor(Smoking, levels = c(0,1),labels = c("No","Yes"))) %>%
+  mutate(ECOG = factor(ECOG, levels = c(0,1),labels = c("0-1","≥2"))) %>%
+  mutate(CSF_cytology = factor(CSF_cytology, levels = c(0,1),labels = c("Negative","Positive"))) %>%
+  mutate(Sys_ORR = factor(Sys_ORR, levels = c(0,1),labels = c("No progression","Progrsssion"))) %>%
+  mutate(Met_burden = factor(Met_burden, levels = c(0,1),labels = c("<3","≥3"))) %>%
+  mutate(CNS_met = factor(CNS_met, levels = c(0,1,2),labels = c("No","LM","BM"))) %>%
+  mutate(CSF_unique = factor(CSF_unique, levels = c(0,1),labels = c("Negative","Positive"))) %>%
+  mutate(CSF_ctDNA = factor(CSF_ctDNA, levels = c(0,1),labels = c("Negative","Positive"))) %>%
+  mutate(OS_event2 = factor(OS_event, levels = c(0,1),labels = c("Alive","Dead")))
+
+
+table1(~Age+Sex+Pathology+Smoking+ECOG+CSF_cytology+Sys_ORR+Met_burden+CNS_met+CSF_unique+CSF_ctDNA+OS_event2+EGFR+TP53+KRAS+RB1+SMAD4+CDKN2A+MYC+STK11+CDK6,data = clinic2)
+
+
+```
+
+
+
+## 2. Randomization
+
+```{r}
+
+cli2 <- clinic2 %>%
+  filter(!is.na(OS_event))
+
+set.seed(12345678)
+
+train <- sample(1:nrow(cli2),nrow(cli2)/2)
+
+cli2 <- cli2 %>%
+  mutate(randomization = ifelse(rownames(.) %in% train, "Train","Test"))
+
+table1(~Age+Sex+Pathology+Smoking+ECOG+CSF_cytology+Sys_ORR+Met_burden+CNS_met+CSF_unique+CSF_ctDNA+OS_event2+EGFR+TP53+KRAS+SMAD4|randomization,data = cli2,overall=F, extra.col=list(`P-value`=pvalue))
+
+```
+
+
+
+## 3. Univariable cox regression in the training set
+```{r}
+
+train<- cli2[cli2$randomization  =="Train",]
+test<- cli2[cli2$randomization  =="Test",]
+variable <- c("ECOG","CSF_cytology","Sys_ORR","Met_burden","CSF_unique","CSF_ctDNA","EGFR","TP53","KRAS","RB1","CDKN2A","MYC","SMAD4")
+cox.result<- Get_coxResult(train,variable)
+
+plotutil_univariant_forestplot(cox.result)
+```
+
+
+
+## 4. Multivariable cox regression in the training cohort
+
+```{r}
+
+model<- summary(coxph(Surv(OS_month, OS_event) ~  RB1 + Met_burden + Sys_ORR + CSF_ctDNA +ECOG , data = train))
+
+
+
+cox.multi<- data.frame("Variant" = c("RB1","Met_burden", "Sys_ORR" ,"CSF_ctDNA", "ECOG"),
+                  "HR" = round(model$conf.int[,1],2),
+                 "lower.95.CI" =  round(model$conf.int[,3],2),
+                 "upper.95.CI" =  round(model$conf.int[,4],2),
+                  "P.cox" = round(model$coefficients[,'Pr(>|z|)'],5),
+                 "P.logrank" = round( model$coefficients[,'Pr(>|z|)'],5))
+                  
+
+
+cox.multi$Hazard.ratio <-  paste0(format(cox.multi$HR,nsmall=2)," (",format(cox.multi$lower.95.CI,nsamll = 2),"–", format(cox.multi$upper.95.CI,nsmall = 2),")")
+
+  cox.multi <- cox.multi[order(cox.multi$HR,decreasing = T),]
+
+plotutil_univariant_forestplot(cox.multi)
+
+
+
+```
+
+
+## 5. KM curves
+```{r}
+dd<- datadist(train)
+options (datadist = "dd") 
+
+coxfit<- cph(Surv(OS_month, OS_event) ~ RB1 + Met_burden + Sys_ORR + CSF_ctDNA +ECOG, 
+        data = train,x=T,y=T,surv=T)
+
+
+risk_score <- predict(coxfit,newdata = train,type = "lp")
+risk_score2_train  <- plogis(risk_score)
+train$risk <- as.vector(ifelse(risk_score2_train>=median(risk_score2_train),1,0))
+
+risk_score <- predict(coxfit,newdata = test,type = "lp")
+risk_score2_test  <- plogis(risk_score)
+test$risk <- as.vector(ifelse(risk_score2_test>=median(risk_score2_train),1,0))
+
+
+print_km(train, "OS_month","OS_event","risk","Overall survival (%)",c("Low-risk","High-risk"))
+
+print_km(test, "OS_month","OS_event","risk","Overall survival (%)",c("Low-risk","High-risk"))
+
+
+
+
+```
+ 
+### 6. External validation
+```{r}
+
+vali <- read.xlsx("./clean data/External validation-2023-10-7.xlsx") 
+
+vali2 <- vali %>%
+  mutate(ECOG = factor(ECOG, levels = c(0,1),labels = c("0-1","≥2"))) %>%
+  mutate(Sys_ORR = factor(Sys_ORR, levels = c(0,1),labels = c("No progression","Progrsssion"))) %>%
+  mutate(Met_burden = factor(Met_burden, levels = c(0,1),labels = c("<3","≥3"))) %>%
+  mutate(CSF_ctDNA = factor(CSF_ctDNA, levels = c(0,1),labels = c("Negative","Positive"))) %>%
+  mutate(RB1 = case_when(
+    RB1 =="Mut"~1,
+    RB1 =="Wild-type"~0
+  ))
+
+
+
+risk_score <- predict(coxfit,newdata = vali2,type = "lp")
+risk_score2_vali  <- plogis(risk_score)
+vali2$risk <- as.vector(ifelse(risk_score2_vali>=median(risk_score2_train),1,0))
+
+print_km(vali2, "OS_month","OS_event","risk","Overall survival (%)",c("Low_risk","High_risk"))
+
+
+
+
+```
+
+
